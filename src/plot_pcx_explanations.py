@@ -20,6 +20,11 @@ from crp.helper import get_layer_names
 from LCRP.utils.crp_configs import ATTRIBUTORS, CANONIZERS, VISUALIZATIONS, COMPOSITES
 from crp.concepts import ChannelConcept
 from sklearn.mixture import GaussianMixture
+
+# For KMeans
+from sklearn.cluster import KMeans
+from scipy.spatial.distance import cdist
+
 from LCRP.utils.render import vis_opaque_img_border
 from crp.image import imgify
 from torchvision.utils import draw_segmentation_masks, draw_bounding_boxes, make_grid
@@ -113,7 +118,6 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts=5, n
     attributions = torch.from_numpy(np.load(folder + "attributions.npy"))
 
     
-    
     # Training GMM based on relevances if not done already
     # Initialize Gaussian Mixture Model (GMM) with specified number of prototypes as components
     cache_path = f'output/pcx/gmm_cache_{layer_name}.pkl'
@@ -142,6 +146,7 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts=5, n
     # Running attribution on the input image
     attr = attribution(data.requires_grad_(), condition, composite, record_layer=[layer_name],
                            init_rel=1)
+
     
     # Channel (neuron) relevance on the given layer for this image
     channel_rels = cc.attribute(attr.relevances[layer_name], abs_norm=True)
@@ -320,13 +325,9 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts=5, n
 
     plt.show()
 
-    return gmm, mean, channel_rels
 
 
-
-def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.center.0.0", num_prototypes=2, output_dir_pcx="output/pcx/unet_flood/"):  #automate the task of finding outlier samples
-
-    #setting model to eval state
+def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.center.0.0", num_prototypes=2, output_dir_pcx="output/pcx/unet_flood/"):
     model.eval()
     layer_names = get_layer_names(model, types=[torch.nn.Conv2d])
 
@@ -334,12 +335,6 @@ def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.cente
     attribution = ATTRIBUTORS[model_name](model)
     composite = COMPOSITES[model_name](canonizers=[CANONIZERS[model_name]()])
 
-    fv = VISUALIZATIONS[model_name](attribution, dataset, layer_names,
-                                     preprocess_fn=lambda x: x,
-                                     path=output_dir_pcx,
-                                     max_target="max")
-
-    # Load or compute the GMM
     folder = f"{output_dir_pcx}/{layer_name}/"
     attributions = torch.from_numpy(np.load(folder + "attributions.npy"))
     cache_path = f'output/pcx/gmm_cache_{layer_name}.pkl'
@@ -350,15 +345,121 @@ def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.cente
         gmm = GaussianMixture(n_components=num_prototypes, reg_covar=1e-5, random_state=0).fit(attributions)
         joblib.dump(gmm, cache_path)
 
-    #log-likelihood scores
-    scores = gmm.score_samples(attributions)
+    # Create individual GMMs for each prototype
+    prototype_gmms = [GaussianMixture(n_components=1, covariance_type='full') for _ in range(num_prototypes)]
+    for p, g_ in enumerate(prototype_gmms):
+        g_._set_parameters([
+            param[p:p + 1] if j > 0 else param[p:p + 1] * 0 + 1
+            for j, param in enumerate(gmm._get_parameters())
+        ])
 
-    # Define outlier thresholds (e.g., 1st and 99th percentiles)
-    lower_threshold = np.percentile(scores, 1)
-    upper_threshold = np.percentile(scores, 99)
+    # Get best likelihood across prototypes
+    # attributions from the dataset passed across prototypes
+    likelihoods = np.stack([g_.score_samples(attributions) for g_ in prototype_gmms])
+    best_likelihoods = np.max(likelihoods, axis=0)
 
-    # Get outlier indices
-    outliers = [i for i, score in enumerate(scores)
+    # Thresholds and outlier detection
+    lower_threshold = np.percentile(best_likelihoods, 1)
+    upper_threshold = np.percentile(best_likelihoods, 99)
+
+    outliers = [i for i, score in enumerate(best_likelihoods)
                 if score < lower_threshold or score > upper_threshold]
 
-    return outliers, scores, lower_threshold, upper_threshold
+    return outliers, best_likelihoods, lower_threshold, upper_threshold
+
+
+
+def plot_pcx_kmeans_explanations(model_name, model, dataset, sample_id, n_concepts=5, n_refimgs=12, num_prototypes=2, layer_name="decoder.center.0.0", ref_imgs_path="output/ref_imgs/", output_dir_pcx="output/pcx_kmeans/unet_flood/"):
+   
+    # Set model to eval
+    model.eval()
+
+    # Set up CRP
+    attribution = ATTRIBUTORS[model_name](model)
+    composite = COMPOSITES[model_name](canonizers=[CANONIZERS[model_name]()])
+    layer_names = get_layer_names(model, types=[torch.nn.Conv2d])
+    fv = VISUALIZATIONS[model_name](attribution, dataset, layer_names, preprocess_fn=lambda x: x, path=output_dir_pcx, max_target="max")
+
+    # Get sample
+    data, _ = fv.get_data_sample(sample_id, preprocessing=False)
+
+    # Load attributions
+    folder = f"{output_dir_pcx}/{layer_name}/"
+    attributions = torch.from_numpy(np.load(folder + "attributions.npy"))
+
+    # Fit KMeans
+    kmeans = KMeans(n_clusters=num_prototypes, random_state=0).fit(attributions)
+    centroids = torch.from_numpy(kmeans.cluster_centers_)
+
+    # Compute distances from each sample to its closest centroid
+    from scipy.spatial.distance import cdist
+    distances = cdist(attributions, kmeans.cluster_centers_)
+    min_dists = distances.min(axis=1)
+
+    # Identify sample closest to a centroid
+    closest_sample_to_centroid = min_dists.argmin().item()
+
+    # Get channel relevance for the current sample
+    attr = attribution(data.requires_grad_(), [{"y": 1}], composite, record_layer=[layer_name], init_rel=1)
+    cc = ChannelConcept()
+    channel_rels = cc.attribute(attr.relevances[layer_name], abs_norm=True)
+
+    # Get top-k concepts
+    topk = torch.topk(channel_rels[0], n_concepts)
+    topk_ind = topk.indices.detach().cpu().numpy()
+
+    # Reference images for each concept
+    ref_imgs = get_ref_images(fv, topk_ind, layer_name, composite=composite, n_ref=n_refimgs, ref_imgs_save_path=ref_imgs_path)
+
+    # Prototype image
+    data_p, target_p = dataset[closest_sample_to_centroid]
+    data_p = data_p.to(device)[None]
+
+    # Heatmaps
+    attr_p = attribution(data_p.requires_grad_(), [{"y": 1}], composite, record_layer=[layer_name])
+    conditions = [{"y": 1, layer_name: c} for c in topk_ind]
+    cond_heatmap, _, _, _ = attribution(data.requires_grad_(), conditions, composite)
+    cond_heatmap_p, _, _, _ = attribution(data_p.requires_grad_(), conditions, composite)
+
+    # Visualization
+    fig, axs = plt.subplots(n_concepts, 6, figsize=(20, 3 * n_concepts))
+    resize = torchvision.transforms.Resize((150, 150), antialias=True)
+
+    sample_ = dataset.reverse_augmentation(data)
+    mask = (attr.prediction[0].argmax(dim=0) == 1).detach().cpu()
+    img_ = F.to_pil_image(draw_segmentation_masks(sample_[:3, :, :][0], masks=mask, alpha=0.3, colors=["red"]))
+
+    sample_prototype = dataset.reverse_augmentation(data_p)
+    mask_prototype = (((target_p - target_p.min()) / (target_p.max() - target_p.min())) > 0.5)[0]
+    img_prototype = F.to_pil_image(draw_segmentation_masks(sample_prototype[:3, :, :][0], masks=mask_prototype, alpha=0.3, colors=["red"]))
+
+    for r in range(n_concepts):
+        axs[r, 0].imshow(img_)
+        axs[r, 0].set_title("Input")
+
+        axs[r, 1].imshow(imgify(cond_heatmap[r], symmetric=True, cmap="bwr", padding=True))
+        axs[r, 1].set_title("Localization")
+
+        grid = make_grid([resize(torch.from_numpy(np.asarray(i).copy()).permute((2, 0, 1))) for i in ref_imgs[topk_ind[r]]], nrow=int(n_refimgs / 2), padding=0)
+        axs[r, 2].imshow(imgify(grid.detach().cpu()))
+        axs[r, 2].set_title("Concept examples")
+
+        delta_R = (channel_rels[0][topk_ind[r]].item() - centroids[0][topk_ind[r]].item()) * 100
+        color = "#ff0000" if abs(delta_R) > 2 else "#00cc00"
+        axs[r, 3].imshow(np.ones((150, 150, 3)) * (1 if color == "#00cc00" else 0.7))
+        axs[r, 3].set_title(f"Delta R: {delta_R:+.1f}%")
+
+        axs[r, 4].imshow(imgify(cond_heatmap_p[r], symmetric=True, cmap="bwr", padding=True))
+        axs[r, 4].set_title("Prototype loc")
+
+        axs[r, 5].imshow(img_prototype)
+        axs[r, 5].set_title("Prototype")
+
+        for c in range(6):
+            axs[r, c].axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
+    return kmeans, centroids, channel_rels
+
